@@ -21,6 +21,23 @@ let bot: TelegramBot | null = null;
 const pendingQuestions = new Map<string, (answer: string) => void>();
 let lastQuestionId: string | null = null;
 
+const MCP_PROGRESS_INTERVAL_MS = (() => {
+  const DEFAULT_MS = 10_000;
+  const MIN_MS = 1_000;
+  const raw = process.env.MCP_PROGRESS_INTERVAL_MS;
+  if (!raw) return DEFAULT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.error(`Invalid MCP_PROGRESS_INTERVAL_MS=${raw}; using ${DEFAULT_MS}ms`);
+    return DEFAULT_MS;
+  }
+  if (parsed < MIN_MS) {
+    console.error(`MCP_PROGRESS_INTERVAL_MS too small (${parsed}); clamping to ${MIN_MS}ms`);
+    return MIN_MS;
+  }
+  return parsed;
+})();
+
 async function initializeBot() {
   try {
     // Create new bot instance with minimal polling configuration
@@ -271,6 +288,40 @@ class McpServer {
     process.stdout.write(JSON.stringify(response) + "\n");
   }
 
+  private sendNotification(method: string, params?: any) {
+    this.sendResponse({
+      jsonrpc: "2.0",
+      method,
+      params
+    });
+  }
+
+  private startProgressNotifications(progressToken: unknown): (() => void) | undefined {
+    if (progressToken === undefined || progressToken === null) return undefined;
+    if (typeof progressToken !== 'string' && typeof progressToken !== 'number') {
+      console.error('Ignoring invalid progressToken type:', typeof progressToken);
+      return undefined;
+    }
+
+    let progress = 0;
+    const token = progressToken;
+
+    const sendProgress = () => {
+      this.sendNotification('notifications/progress', {
+        progressToken: token,
+        progress
+      });
+      progress += 1;
+    };
+
+    // Emit immediately to avoid long periods of silence, then periodically while waiting.
+    sendProgress();
+    const interval = setInterval(sendProgress, MCP_PROGRESS_INTERVAL_MS);
+    (interval as any).unref?.();
+
+    return () => clearInterval(interval);
+  }
+
   private handleInput(chunk: string) {
     this.buffer += chunk;
     const messages = this.buffer.split('\n');
@@ -391,8 +442,15 @@ class McpServer {
       case 'tools/call':
         try {
           switch (request.params.name) {
-            case 'ask_user':
-              const answer = await askUser(request.params.arguments);
+            case 'ask_user': {
+              const stopProgress = this.startProgressNotifications(request.params?._meta?.progressToken);
+              let answer: string;
+              try {
+                answer = await askUser(request.params.arguments);
+              } finally {
+                stopProgress?.();
+              }
+
               this.sendResponse({
                 jsonrpc: "2.0",
                 id: request.id,
@@ -404,6 +462,7 @@ class McpServer {
                 }
               });
               break;
+            }
 
             case 'notify_user':
               await notifyUser(request.params.arguments);
